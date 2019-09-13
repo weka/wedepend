@@ -2,10 +2,11 @@ SRCS=$(wildcard *.d) $(wildcard libdparse/src/dparse/*.d) $(wildcard libdparse/s
 	 $(wildcard libdparse/stdx-allocator/source/stdx/allocator/*.d) \
 	 $(wildcard libdparse/stdx-allocator/source/stdx/allocator/building_blocks/*.d)
 
+DCOMPILER=ldc2
 FLAGS=-g
 
 wedepend: ${SRCS}
-	ldc2 ${FLAGS} -d  -of=$@ -I=libdparse/src -I libdparse/stdx-allocator/source -g $^
+	$(DCOMPILER) ${FLAGS} -d  -of=$@ -I=libdparse/src -I libdparse/stdx-allocator/source -g $^
 
 clean:
 	-rm -f wedepend wedepend.o
