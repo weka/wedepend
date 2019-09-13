@@ -108,12 +108,23 @@ class CopySourcePrinter : ASTVisitor{
         //stderr.writefln("  version condition len %d at %d: %s (%s)", condDecls.length, visitor.token.line, visitor.token.text, str(visitor.token.type));
         auto condDecl = &condDecls[$-1];
 
-        if (str(visitor.token.type) == "unittest") {
+        auto tokenStr = str(visitor.token.type);
+        if (tokenStr == "unittest") {
             condDecl.decidedCondition = true;
             condDecl.versionName = "unittest";
             condDecl.inTrueDeclaration = includeUnittest;
-        } else {
+        } else if (tokenStr == "identifier") {
             condDecl.versionName = visitor.token.text;
+            if (versions.length > 0) {
+                // The user gave us a set of versions, we assume this set is complete and we can decide on the versions supported
+                condDecl.decidedCondition = true;
+                foreach (ver; versions) {
+                    if (ver == condDecl.versionName) {
+                        condDecl.inTrueDeclaration = true;
+                        break;
+                    }
+                }
+            }
         }
 
         // TODO: handle other version definitions (assert, debug_assert, etc.)
@@ -126,6 +137,7 @@ class CopySourcePrinter : ASTVisitor{
     int unittestCount = 0;
     bool includeUnittest;
     ConditionalDeclarations[] condDecls;
+    string[] versions;
 }
 
 void noMsg(string filename, size_t line, size_t column, string message, bool error) {
@@ -139,7 +151,7 @@ void errorMsg(string filename, size_t line, size_t column, string message, bool 
     stderr.writefln("%s(%d:%d)[warn]: %s", filename, line, column, message);
 }
 
-void calcDependencies(File output, string inputFile, bool includeUnittest, bool verbose) {
+void calcDependencies(File output, string inputFile, bool includeUnittest, bool verbose, string[] versions) {
     auto bytes = readInputFile(inputFile);
 
     StringCache cache = StringCache(StringCache.defaultBucketCount);
@@ -162,5 +174,6 @@ void calcDependencies(File output, string inputFile, bool includeUnittest, bool 
     printer.fileName = inputFile;
     printer.output = output;
     printer.includeUnittest = includeUnittest;
+    printer.versions = versions;
     printer.visit(m);
 }
