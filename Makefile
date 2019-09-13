@@ -6,7 +6,7 @@ DCOMPILER=ldc2
 FLAGS=-g
 
 wedepend: ${SRCS}
-	$(DCOMPILER) ${FLAGS} -d  -of=$@ -I=libdparse/src -I libdparse/stdx-allocator/source -g $^
+	$(DCOMPILER) ${FLAGS} -d  -of=$@ -I=libdparse/src -I=libdparse/stdx-allocator/source -g $^
 
 clean:
 	-rm -f wedepend wedepend.o
