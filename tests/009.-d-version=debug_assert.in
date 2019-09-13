@@ -1,0 +1,5 @@
+module a;
+
+version (debug_assert) {
+    import std.test;
+}

@@ -1,0 +1,7 @@
+module a;
+
+static if (false) {
+    import std.false_cond;
+} else {
+    import std.true_cond;
+}

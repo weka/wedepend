@@ -1,2 +1,4 @@
 wedepend
 wedepend.o
+tests/*.tmp
+tests/*.err

@@ -1,0 +1,5 @@
+module a;
+
+version (unittest) {
+    import std.test;
+}

@@ -1,0 +1,5 @@
+static if (0) {
+    import std.false_cond;
+} else {
+    import std.true_cond;
+}

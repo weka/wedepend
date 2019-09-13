@@ -8,9 +8,12 @@ FLAGS=-g
 wedepend: ${SRCS}
 	$(DCOMPILER) ${FLAGS} -d  -of=$@ -I=libdparse/src -I=libdparse/stdx-allocator/source -g $^
 
+test: all
+	cd tests && ./test.sh
+
 clean:
 	-rm -f wedepend wedepend.o
 
 all: wedepend
 
-.PHONY: clean all
+.PHONY: clean all test``
