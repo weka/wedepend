@@ -130,6 +130,31 @@ class CopySourcePrinter : ASTVisitor{
         // TODO: handle other version definitions (assert, debug_assert, etc.)
     }
 
+    override void visit(const StaticIfCondition visitor)
+    {
+        if (visitor.assignExpression is null) {
+            return;
+        }
+
+        if (visitor.assignExpression.tokens.length != 1) {
+            return;
+        }
+
+        auto token = visitor.assignExpression.tokens[0];
+
+        if (str(token.type) == "intLiteral") {
+            auto condDecl = &condDecls[$-1];
+
+            if (token.text == "0") {
+                condDecl.decidedCondition = true;
+                condDecl.inTrueDeclaration = false;
+            } else if (token.text == "1") {
+                condDecl.decidedCondition = true;
+                condDecl.inTrueDeclaration = true;
+            }
+        }
+    }
+
     alias visit = ASTVisitor.visit;
 
     string fileName;
