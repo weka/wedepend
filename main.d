@@ -1,5 +1,6 @@
 module wedepend.main;
 
+import std.algorithm;
 import std.stdio;
 import wedepend.depcalc;
 
