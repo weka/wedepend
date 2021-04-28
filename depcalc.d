@@ -44,6 +44,10 @@ class CopySourcePrinter : ASTVisitor{
         output.write('\n');
     }
 
+    override void visit(const FunctionBody functionBody)
+    {
+        //functionBody.accept(this);
+    }
     override void visit(const Unittest dec)
     {
         if (!includeUnittest) {
@@ -105,7 +109,7 @@ class CopySourcePrinter : ASTVisitor{
 
     override void visit(const VersionCondition visitor)
     {
-        //stderr.writefln("  version condition len %d at %d: %s (%s)", condDecls.length, visitor.token.line, visitor.token.text, str(visitor.token.type));
+        //stderr.writefln(" version condition len %d at %d: %s (%s)", condDecls.length, visitor.token.line, visitor.token.text, str(visitor.token.type));
         auto condDecl = &condDecls[$-1];
 
         auto tokenStr = str(visitor.token.type);
