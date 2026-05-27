@@ -176,6 +176,222 @@ void errorMsg(string filename, size_t line, size_t column, string message, bool 
     stderr.writefln("%s(%d:%d)[warn]: %s", filename, line, column, message);
 }
 
+private string chainToString(const IdentifierChain chain) {
+    if (chain is null) return "";
+    auto a = appender!string;
+    foreach (i, t; chain.identifiers) {
+        if (i > 0) a.put('.');
+        a.put(t.text);
+    }
+    return a.data;
+}
+
+class ScopeInfoVisitor : ASTVisitor {
+    File output;
+    string[] templateStack;   // outermost first; non-empty => inside a template
+    int containerDepth;       // any nested container (template, agg, function, block)
+
+    alias visit = ASTVisitor.visit;
+
+    private bool isFileScope() const {
+        return templateStack.length == 0 && containerDepth == 0;
+    }
+
+    private string outerTemplate() const {
+        return templateStack.length > 0 ? templateStack[0] : "";
+    }
+
+    private void emitImport(string mod) {
+        if (mod.length == 0) return;
+        if (templateStack.length > 0) {
+            output.writefln("tmpl\t%s\t%s", outerTemplate, mod);
+        } else if (containerDepth > 0) {
+            output.writefln("scoped\t%s", mod);
+        } else {
+            output.writefln("top\t%s", mod);
+        }
+    }
+
+    override void visit(const ImportDeclaration node) {
+        foreach (si; node.singleImports) {
+            if (si is null) continue;
+            emitImport(chainToString(si.identifierChain));
+        }
+        if (node.importBindings !is null) {
+            auto si = node.importBindings.singleImport;
+            if (si !is null) {
+                auto mod = chainToString(si.identifierChain);
+                emitImport(mod);
+                if (mod.length > 0) {
+                    string[] syms;
+                    foreach (b; node.importBindings.importBinds) {
+                        if (b is null) continue;
+                        auto t = b.left.text;
+                        if (t.length > 0) syms ~= t;
+                    }
+                    if (syms.length > 0) {
+                        output.writefln("binding\t%s\t%s", mod, syms.join(","));
+                    }
+                }
+            }
+        }
+    }
+
+    override void visit(const TemplateDeclaration node) {
+        if (isFileScope) {
+            output.writefln("template\t%s", node.name.text);
+        }
+        templateStack ~= node.name.text;
+        containerDepth++;
+        scope(exit) {
+            templateStack = templateStack[0 .. $-1];
+            containerDepth--;
+        }
+        node.accept(this);
+    }
+
+    override void visit(const FunctionDeclaration node) {
+        const isTemplate = node.templateParameters !is null;
+        const topLevel = isFileScope;
+        if (isTemplate) {
+            if (topLevel) output.writefln("template\t%s", node.name.text);
+            templateStack ~= node.name.text;
+        }
+        containerDepth++;
+        scope(exit) {
+            containerDepth--;
+            if (isTemplate) templateStack = templateStack[0 .. $-1];
+        }
+        node.accept(this);
+    }
+
+    override void visit(const StructDeclaration node) {
+        const isTemplate = node.templateParameters !is null;
+        const topLevel = isFileScope;
+        if (isTemplate) {
+            if (topLevel) output.writefln("template\t%s", node.name.text);
+            templateStack ~= node.name.text;
+        }
+        containerDepth++;
+        scope(exit) {
+            containerDepth--;
+            if (isTemplate) templateStack = templateStack[0 .. $-1];
+        }
+        node.accept(this);
+    }
+
+    override void visit(const ClassDeclaration node) {
+        const isTemplate = node.templateParameters !is null;
+        const topLevel = isFileScope;
+        if (isTemplate) {
+            if (topLevel) output.writefln("template\t%s", node.name.text);
+            templateStack ~= node.name.text;
+        }
+        containerDepth++;
+        scope(exit) {
+            containerDepth--;
+            if (isTemplate) templateStack = templateStack[0 .. $-1];
+        }
+        node.accept(this);
+    }
+
+    override void visit(const InterfaceDeclaration node) {
+        const isTemplate = node.templateParameters !is null;
+        const topLevel = isFileScope;
+        if (isTemplate) {
+            if (topLevel) output.writefln("template\t%s", node.name.text);
+            templateStack ~= node.name.text;
+        }
+        containerDepth++;
+        scope(exit) {
+            containerDepth--;
+            if (isTemplate) templateStack = templateStack[0 .. $-1];
+        }
+        node.accept(this);
+    }
+
+    override void visit(const UnionDeclaration node) {
+        const isTemplate = node.templateParameters !is null;
+        const topLevel = isFileScope;
+        if (isTemplate) {
+            if (topLevel) output.writefln("template\t%s", node.name.text);
+            templateStack ~= node.name.text;
+        }
+        containerDepth++;
+        scope(exit) {
+            containerDepth--;
+            if (isTemplate) templateStack = templateStack[0 .. $-1];
+        }
+        node.accept(this);
+    }
+
+    override void visit(const BlockStatement node) {
+        containerDepth++;
+        scope(exit) containerDepth--;
+        node.accept(this);
+    }
+
+    override void visit(const TemplateInstance node) {
+        if (node.identifier.text.length > 0) {
+            output.writefln("instance\t%s\t%s", outerTemplate, node.identifier.text);
+        }
+        node.accept(this);
+    }
+
+    override void visit(const FunctionCallExpression node) {
+        // Skip explicit template calls foo!T(args) — the inner TemplateInstance already emits.
+        if (node.templateArguments is null && node.unaryExpression !is null) {
+            auto callee = extractCallee(node.unaryExpression);
+            if (callee.length > 0) {
+                output.writefln("call\t%s\t%s", outerTemplate, callee);
+            }
+        }
+        node.accept(this);
+    }
+
+    private static string extractCallee(const UnaryExpression u) {
+        if (u is null) return "";
+        if (u.primaryExpression !is null) {
+            auto p = u.primaryExpression;
+            if (p.identifierOrTemplateInstance !is null) {
+                auto iot = p.identifierOrTemplateInstance;
+                if (iot.identifier.text.length > 0) return iot.identifier.text;
+                if (iot.templateInstance !is null && iot.templateInstance.identifier.text.length > 0) {
+                    return iot.templateInstance.identifier.text;
+                }
+            }
+        }
+        if (u.identifierOrTemplateInstance !is null) {
+            auto iot = u.identifierOrTemplateInstance;
+            if (iot.identifier.text.length > 0) return iot.identifier.text;
+            if (iot.templateInstance !is null && iot.templateInstance.identifier.text.length > 0) {
+                return iot.templateInstance.identifier.text;
+            }
+        }
+        return "";
+    }
+}
+
+void scopeInfo(File output, string inputFile) {
+    StringCache cache = StringCache(StringCache.defaultBucketCount);
+    LexerConfig config;
+    config.fileName = inputFile;
+    config.stringBehavior = StringBehavior.source;
+    config.whitespaceBehavior = WhitespaceBehavior.skip;
+
+    auto tokens = getTokensForParser(readInputFile(inputFile), config, &cache).array();
+    if (tokens.length == 0) {
+        stderr.writefln("scope-info: empty token stream for %s", inputFile);
+        return;
+    }
+
+    RollbackAllocator rba;
+    Module m = parseModule(tokens, inputFile, &rba, &noMsg);
+    auto v = new ScopeInfoVisitor;
+    v.output = output;
+    v.visit(m);
+}
+
 void calcDependencies(File output, string inputFile, bool includeUnittest, bool verbose, string[] versions) {
     auto bytes = readInputFile(inputFile);
 
