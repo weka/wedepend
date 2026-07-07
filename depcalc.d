@@ -189,12 +189,23 @@ private string chainToString(const IdentifierChain chain) {
 class ScopeInfoVisitor : ASTVisitor {
     File output;
     string[] templateStack;   // outermost first; non-empty => inside a template
-    int containerDepth;       // any nested container (template, agg, function, block)
+
+    // Stack of nested containers. Each entry is (kind, name). Pushed on
+    // FunctionDeclaration / StructDeclaration / ClassDeclaration /
+    // InterfaceDeclaration / UnionDeclaration / BlockStatement / Unittest.
+    // The innermost (top of stack) determines whether a `scoped` import
+    // lives inside a body that hdrgen elides:
+    //   func, block, unittest  → elided in .di (safe for Bazel implementation_deps)
+    //   struct, class, interface, union → preserved in .di (must be in Bazel deps)
+    // The name field is the enclosing decl name, or "_" for anonymous
+    // (e.g. raw blocks, unittests).
+    struct Container { string kind; string name; }
+    Container[] containerStack;
 
     alias visit = ASTVisitor.visit;
 
     private bool isFileScope() const {
-        return templateStack.length == 0 && containerDepth == 0;
+        return templateStack.length == 0 && containerStack.length == 0;
     }
 
     private string outerTemplate() const {
@@ -205,8 +216,22 @@ class ScopeInfoVisitor : ASTVisitor {
         if (mod.length == 0) return;
         if (templateStack.length > 0) {
             output.writefln("tmpl\t%s\t%s", outerTemplate, mod);
-        } else if (containerDepth > 0) {
-            output.writefln("scoped\t%s", mod);
+        } else if (containerStack.length > 0) {
+            // Find the innermost NAMED container — skip past anonymous blocks
+            // (function-body braces, if/while/with blocks). The kind we report
+            // is the first non-block; the name comes from there. A bare block
+            // with no named ancestor (very unusual at module level) reports as
+            // `block / _`.
+            string kind = "block";
+            string name = "_";
+            foreach_reverse (c; containerStack) {
+                if (c.kind != "block") {
+                    kind = c.kind;
+                    name = c.name;
+                    break;
+                }
+            }
+            output.writefln("scoped\t%s\t%s\t%s", kind, name, mod);
         } else {
             output.writefln("top\t%s", mod);
         }
@@ -242,10 +267,10 @@ class ScopeInfoVisitor : ASTVisitor {
             output.writefln("template\t%s", node.name.text);
         }
         templateStack ~= node.name.text;
-        containerDepth++;
+        containerStack ~= Container("template", node.name.text);
         scope(exit) {
             templateStack = templateStack[0 .. $-1];
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
         }
         node.accept(this);
     }
@@ -257,9 +282,9 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerDepth++;
+        containerStack ~= Container("func", node.name.text);
         scope(exit) {
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
@@ -272,9 +297,9 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerDepth++;
+        containerStack ~= Container("struct", node.name.text);
         scope(exit) {
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
@@ -287,9 +312,9 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerDepth++;
+        containerStack ~= Container("class", node.name.text);
         scope(exit) {
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
@@ -302,9 +327,9 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerDepth++;
+        containerStack ~= Container("interface", node.name.text);
         scope(exit) {
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
@@ -317,17 +342,23 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerDepth++;
+        containerStack ~= Container("union", node.name.text);
         scope(exit) {
-            containerDepth--;
+            containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
     }
 
     override void visit(const BlockStatement node) {
-        containerDepth++;
-        scope(exit) containerDepth--;
+        containerStack ~= Container("block", "_");
+        scope(exit) containerStack = containerStack[0 .. $-1];
+        node.accept(this);
+    }
+
+    override void visit(const Unittest node) {
+        containerStack ~= Container("func", "_unittest");
+        scope(exit) containerStack = containerStack[0 .. $-1];
         node.accept(this);
     }
 
