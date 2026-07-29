@@ -202,6 +202,21 @@ class ScopeInfoVisitor : ASTVisitor {
     struct Container { string kind; string name; }
     Container[] containerStack;
 
+    // Depth of enclosing function/unittest BODIES (BlockStatement under executable
+    // code). hdrgen ELIDES these from the .di, so identifier references at
+    // bodyDepth>0 do NOT leak through this file's interface. References at
+    // bodyDepth==0 (return/param/field types, template params/constraints,
+    // manifest-constant initializers, default args) DO appear in the .di and so
+    // propagate to consumers. Used to emit `ifaceref` for interface-position
+    // symbol uses only.
+    int bodyDepth;
+
+    // True while visiting a `public import`/`export import` declaration. Such
+    // imports RE-EXPORT their symbols to consumers regardless of local use, so
+    // they must always propagate — emitted as a `public <mod>` marker that the
+    // scanner uses to exempt the module from usage-based reclassification.
+    bool inPublicDecl;
+
     alias visit = ASTVisitor.visit;
 
     private bool isFileScope() const {
@@ -235,6 +250,27 @@ class ScopeInfoVisitor : ASTVisitor {
         } else {
             output.writefln("top\t%s", mod);
         }
+        if (inPublicDecl) {
+            output.writefln("public\t%s", mod);
+        }
+    }
+
+    // A `public`/`export` qualifier on an import declaration makes it a
+    // re-export. Mark inPublicDecl for the duration of this Declaration's accept
+    // so emitImport tags its modules. A Declaration wrapping an import contains
+    // only that import (no nested decls), so the flag can't leak.
+    override void visit(const Declaration node) {
+        bool pub = false;
+        foreach (a; node.attributes) {
+            if (a.attribute.type == tok!"public" || a.attribute.type == tok!"export") {
+                pub = true;
+                break;
+            }
+        }
+        bool saved = inPublicDecl;
+        if (pub && node.importDeclaration !is null) inPublicDecl = true;
+        scope(exit) inPublicDecl = saved;
+        node.accept(this);
     }
 
     override void visit(const ImportDeclaration node) {
@@ -352,13 +388,49 @@ class ScopeInfoVisitor : ASTVisitor {
 
     override void visit(const BlockStatement node) {
         containerStack ~= Container("block", "_");
-        scope(exit) containerStack = containerStack[0 .. $-1];
+        bodyDepth++;
+        scope(exit) { containerStack = containerStack[0 .. $-1]; bodyDepth--; }
         node.accept(this);
     }
 
     override void visit(const Unittest node) {
         containerStack ~= Container("func", "_unittest");
-        scope(exit) containerStack = containerStack[0 .. $-1];
+        bodyDepth++;
+        scope(exit) { containerStack = containerStack[0 .. $-1]; bodyDepth--; }
+        node.accept(this);
+    }
+
+    // Emit every identifier referenced in an INTERFACE position (bodyDepth==0):
+    // type names in signatures/fields, template params/constraints, manifest
+    // initializers, default args — the identifiers that survive into the .di.
+    // The Go/analysis side attributes each to its declaring module via the
+    // top-level declares-index; a `top`/selective import propagates only if it
+    // provides an ifaceref'd symbol. Body-only references (bodyDepth>0) are
+    // omitted — they're elided from the .di and don't propagate.
+    override void visit(const IdentifierOrTemplateInstance node) {
+        if (bodyDepth == 0) {
+            if (node.identifier.text.length > 0) {
+                output.writefln("ifaceref\t%s", node.identifier.text);
+            } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
+                output.writefln("ifaceref\t%s", node.templateInstance.identifier.text);
+            }
+        }
+        node.accept(this);
+    }
+
+    // UDAs (`@attribute(...)`, `@foo!T`) annotate declarations and are PRESERVED
+    // in the .di (hdrgen keeps attributes on signatures), so their symbol leaks
+    // through this file's interface and must count as an ifaceref. The UDA name
+    // is a bare Token on AtAttribute (not wrapped in IdentifierOrTemplateInstance),
+    // so the visitor above never sees it — emit it here.
+    override void visit(const AtAttribute node) {
+        if (bodyDepth == 0) {
+            if (node.identifier.text.length > 0) {
+                output.writefln("ifaceref\t%s", node.identifier.text);
+            } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
+                output.writefln("ifaceref\t%s", node.templateInstance.identifier.text);
+            }
+        }
         node.accept(this);
     }
 
