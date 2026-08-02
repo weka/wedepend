@@ -186,6 +186,86 @@ private string chainToString(const IdentifierChain chain) {
     return a.data;
 }
 
+private bool isStringLiteralToken(const Token t) {
+    return t.type == tok!"stringLiteral" || t.type == tok!"wstringLiteral" || t.type == tok!"dstringLiteral";
+}
+
+// Strips one layer of matching quote characters (and a trailing c/w/d
+// string-literal suffix, if present) from a lexed string-literal token's
+// raw text. Best-effort — doesn't unescape backslash sequences, since the
+// UDA-name use case (module names, symbol names) never needs them.
+private string stripStringQuotes(string s) {
+    if (s.length < 2) return s;
+    char q = s[0];
+    if (q != '"' && q != '\'' && q != '`') return s;
+    size_t end = s.length;
+    if (end > 0 && (s[end - 1] == 'c' || s[end - 1] == 'w' || s[end - 1] == 'd')) end--;
+    if (end < 2 || s[end - 1] != q) return s;
+    return s[1 .. end - 1].idup;
+}
+
+// Descends through dparse's expression-precedence wrapper chain via the
+// visitor pattern (so it doesn't need to know every intermediate node type
+// between e.g. AssignExpression and PrimaryExpression) down to leaf
+// PrimaryExpressions, collecting string-literal tokens. Used to read the
+// argument to @GazelleEmits(["a", "b"])-style UDAs.
+private final class LiteralStringCollector : ASTVisitor {
+    alias visit = ASTVisitor.visit;
+    string[] strings;
+
+    override void visit(const PrimaryExpression node) {
+        if (isStringLiteralToken(node.primary)) {
+            strings ~= stripStringQuotes(node.primary.text);
+            return;
+        }
+        node.accept(this);
+    }
+}
+
+// Extracts string literals from a UDA argument expected to be a literal
+// array of strings (e.g. @GazelleEmits(["a", "b"])) or a single literal
+// string. Literal args only, per the plan: a non-literal argument (a
+// variable, a call, string concatenation) is reported on stderr and
+// contributes nothing rather than guessed at.
+private string[] extractStringArrayArg(const ArgumentList argList, string udaName) {
+    if (argList is null || argList.items.length == 0) {
+        stderr.writefln("wedepend: @%s: no argument found; skipping", udaName);
+        return [];
+    }
+    if (argList.items.length > 1) {
+        stderr.writefln("wedepend: @%s: expected a single array-literal argument, got %d; skipping",
+            udaName, argList.items.length);
+        return [];
+    }
+    auto collector = new LiteralStringCollector;
+    argList.items[0].accept(collector);
+    if (collector.strings.length == 0) {
+        stderr.writefln("wedepend: @%s: argument is not a literal string (array); skipping", udaName);
+    }
+    return collector.strings;
+}
+
+// Pending genemits/genpattern/genunknown/genctfecalls data collected from a
+// Declaration's UDA list (visit(const Declaration node)) — attributes are
+// visited before the declaration they annotate is reached (Declaration.accept
+// visits `attributes` then `declarations`), so this is buffered here and
+// flushed by emitDeclares once the declaration's name is known. Cleared
+// unconditionally after each Declaration node (see visit(const Declaration)):
+// a UDA that never reaches a top-level emitDeclares call (e.g. it decorates
+// something outside file scope, or a declaration kind emitDeclares doesn't
+// cover) is dropped rather than leaking into the next Declaration — a known
+// P1 limitation (module-scope-only, see ScopeInfoVisitor doc comment).
+private struct PendingUda {
+    string[] emits;
+    string[] patterns;
+    bool unknown;
+    string[] ctfeCalls;
+
+    bool empty() const {
+        return emits.length == 0 && patterns.length == 0 && !unknown && ctfeCalls.length == 0;
+    }
+}
+
 class ScopeInfoVisitor : ASTVisitor {
     File output;
     string[] templateStack;   // outermost first; non-empty => inside a template
@@ -211,11 +291,27 @@ class ScopeInfoVisitor : ASTVisitor {
     // symbol uses only.
     int bodyDepth;
 
+    // Depth of enclosing CTFE-root contexts (see visitCtfe): enum member
+    // initializers, static if/assert/foreach, template value arguments,
+    // mixin(...) arguments, UDA arguments, pragma arguments, static array
+    // dimensions, and module-level/static/immutable variable initializers.
+    // Independent of bodyDepth — a CTFE root can appear INSIDE a function
+    // body (e.g. a `static if` nested in a plain function) and still forces
+    // compile-time evaluation of whatever it contains. Used to emit
+    // `ctferef`/`ctferef_tmpl` for identifiers referenced in these positions
+    // (docs/ctfe-per-symbol.md's CTFE-roots list) — a ref can be both an
+    // ifaceref and a ctferef simultaneously (e.g. a manifest constant's
+    // initializer at module scope is both).
+    int ctfeDepth;
+
     // True while visiting a `public import`/`export import` declaration. Such
     // imports RE-EXPORT their symbols to consumers regardless of local use, so
     // they must always propagate — emitted as a `public <mod>` marker that the
     // scanner uses to exempt the module from usage-based reclassification.
     bool inPublicDecl;
+
+    // See PendingUda's doc comment.
+    PendingUda pendingUda;
 
     alias visit = ASTVisitor.visit;
 
@@ -225,6 +321,90 @@ class ScopeInfoVisitor : ASTVisitor {
 
     private string outerTemplate() const {
         return templateStack.length > 0 ? templateStack[0] : "";
+    }
+
+    // Nearest enclosing function's name (containerStack searched innermost
+    // first, skipping non-func containers — a call nested in an `if` block
+    // inside a function still attributes to that function). "_" for a call
+    // with no enclosing function (module-scope initializer, aggregate field
+    // default, etc.) — see the `call` tag's doc comment on FunctionCallExpression.
+    private string currentFunctionName() const {
+        foreach_reverse (c; containerStack) {
+            if (c.kind == "func") return c.name;
+        }
+        return "_";
+    }
+
+    // Runs `node` with ctfeDepth incremented for its duration — used by every
+    // CTFE-root context (see ctfeDepth's doc comment). Visits the WHOLE node
+    // (not just its value sub-expression): for constructs with both a
+    // compile-time-evaluated part and an ordinary body (static if/foreach),
+    // this over-includes the body in ctfeDepth rather than precisely
+    // isolating the condition/range expression — deliberate, matching the
+    // plan's conservative bias (over-tagging a ctferef is safe; missing one
+    // risks under-un-headering a file the CTFE walk actually needs raw).
+    private void visitCtfe(const BaseNode node) {
+        if (node is null) return;
+        ctfeDepth++;
+        scope(exit) ctfeDepth--;
+        node.accept(this);
+    }
+
+    private static bool hasStorageClass(const StorageClass[] classes, string tokStr) {
+        foreach (sc; classes) {
+            if (sc is null) continue;
+            if (str(sc.token.type) == tokStr) return true;
+        }
+        return false;
+    }
+
+    // Emits `declares <name> <kind>` for a MODULE-SCOPE (isFileScope) top-level
+    // declaration only — P1 scope decision: aggregate members are not declared
+    // individually here. Rationale (docs/ctfe-per-symbol.md's symbol->file
+    // attribution design): a member resolves to a symbol via its ENCLOSING
+    // aggregate anyway (the Go-side declares-index attributes a member access
+    // like `Foo.bar` to Foo's file through Foo's own top-level declares entry),
+    // so a separate per-member row isn't needed for file attribution — only
+    // module-scope declarations need their own entry. Also flushes any
+    // pendingUda collected from this declaration's attribute list (see
+    // PendingUda) now that its name is known.
+    private void emitDeclares(string name, string kind) {
+        if (!isFileScope || name.length == 0) return;
+        output.writefln("declares\t%s\t%s", name, kind);
+        if (!pendingUda.empty) {
+            foreach (n; pendingUda.emits) output.writefln("genemits\t%s\t%s", name, n);
+            foreach (p; pendingUda.patterns) output.writefln("genpattern\t%s\t%s", name, p);
+            if (pendingUda.unknown) output.writefln("genunknown\t%s", name);
+            foreach (m; pendingUda.ctfeCalls) output.writefln("genctfecalls\t%s\t%s", name, m);
+            pendingUda = PendingUda.init;
+        }
+    }
+
+    // Reads a single Attribute for our recognized generator UDAs
+    // (@GazelleEmits / @GazelleEmitsPattern / @GazelleEmitsUnknown /
+    // @GazelleCtfeCalls) and buffers matches into pendingUda — see its doc
+    // comment for why this is buffered rather than emitted immediately.
+    private void collectGazelleUda(const Attribute a) {
+        if (a is null || a.atAttribute is null) return;
+        auto at = a.atAttribute;
+        string name = at.identifier.text;
+        if (name.length == 0) return;
+        switch (name) {
+        case "GazelleEmits":
+            pendingUda.emits ~= extractStringArrayArg(at.argumentList, name);
+            break;
+        case "GazelleEmitsPattern":
+            pendingUda.patterns ~= extractStringArrayArg(at.argumentList, name);
+            break;
+        case "GazelleEmitsUnknown":
+            pendingUda.unknown = true;
+            break;
+        case "GazelleCtfeCalls":
+            pendingUda.ctfeCalls ~= extractStringArrayArg(at.argumentList, name);
+            break;
+        default:
+            break;
+        }
     }
 
     private void emitImport(string mod) {
@@ -259,6 +439,13 @@ class ScopeInfoVisitor : ASTVisitor {
     // re-export. Mark inPublicDecl for the duration of this Declaration's accept
     // so emitImport tags its modules. A Declaration wrapping an import contains
     // only that import (no nested decls), so the flag can't leak.
+    //
+    // Also scans this Declaration's attribute list for our recognized
+    // generator UDAs (collectGazelleUda) before descending — Declaration.accept
+    // visits attributes, then declarations, so the annotated declaration's
+    // name isn't known yet; buffered in pendingUda and flushed by emitDeclares.
+    // Any pendingUda that nothing consumed by the end of this Declaration is
+    // dropped (see PendingUda's doc comment) rather than leaking sideways.
     override void visit(const Declaration node) {
         bool pub = false;
         foreach (a; node.attributes) {
@@ -270,7 +457,12 @@ class ScopeInfoVisitor : ASTVisitor {
         bool saved = inPublicDecl;
         if (pub && node.importDeclaration !is null) inPublicDecl = true;
         scope(exit) inPublicDecl = saved;
+
+        foreach (a; node.attributes) {
+            collectGazelleUda(a);
+        }
         node.accept(this);
+        pendingUda = PendingUda.init;
     }
 
     override void visit(const ImportDeclaration node) {
@@ -301,6 +493,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const TemplateDeclaration node) {
         if (isFileScope) {
             output.writefln("template\t%s", node.name.text);
+            emitDeclares(node.name.text, "tmpl");
         }
         templateStack ~= node.name.text;
         containerStack ~= Container("template", node.name.text);
@@ -311,9 +504,17 @@ class ScopeInfoVisitor : ASTVisitor {
         node.accept(this);
     }
 
+    // kind: tmpl (has template params, incl. IFTI shorthand `foo(T)(T x)`) >
+    // autoret (hasAuto — inferred return type, body survives hdrgen same as
+    // a template) > plain (default/conservative: body elided by hdrgen).
     override void visit(const FunctionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
+        if (topLevel) {
+            if (isTemplate) emitDeclares(node.name.text, "tmpl");
+            else if (node.hasAuto) emitDeclares(node.name.text, "autoret");
+            else emitDeclares(node.name.text, "plain");
+        }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -329,6 +530,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const StructDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
+        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -344,6 +546,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const ClassDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
+        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -359,6 +562,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const InterfaceDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
+        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -374,6 +578,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const UnionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
+        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -384,6 +589,91 @@ class ScopeInfoVisitor : ASTVisitor {
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
         node.accept(this);
+    }
+
+    // Named enums only — an anonymous `enum { A, B }` declares its MEMBERS
+    // into the enclosing scope, not itself; out of scope for P1 (module-scope
+    // top-level declarations only, see emitDeclares).
+    override void visit(const EnumDeclaration node) {
+        if (isFileScope && node.name.text.length > 0) {
+            emitDeclares(node.name.text, "enum");
+        }
+        node.accept(this);
+    }
+
+    // enum init (CTFE root): each member's initializer expression is
+    // evaluated at compile time.
+    override void visit(const EnumMember node) {
+        if (node.enumMemberAttributes !is null) {
+            foreach (a; node.enumMemberAttributes) {
+                if (a !is null) this.visit(a);
+            }
+        }
+        if (node.type !is null) this.visit(node.type);
+        visitCtfe(node.assignExpression);
+    }
+
+    // Old-style `alias Bar Foo;` (declaratorIdentifierList) and modern
+    // `alias Foo = Bar;` (initializers) both declare their name(s) as `alias`.
+    override void visit(const AliasDeclaration node) {
+        if (isFileScope) {
+            foreach (init; node.initializers) {
+                if (init !is null && init.name.text.length > 0) {
+                    emitDeclares(init.name.text, "alias");
+                }
+            }
+            if (node.declaratorIdentifierList !is null) {
+                foreach (t; node.declaratorIdentifierList.identifiers) {
+                    if (t.text.length > 0) emitDeclares(t.text, "alias");
+                }
+            }
+        }
+        node.accept(this);
+    }
+
+    // Module-level (or explicitly static/immutable at any depth) variable
+    // declaration(s) — `int x, y;`, `immutable int x = f();`. Each declarator
+    // is its own top-level symbol. The initializer is a CTFE root when it's
+    // module-scope or carries a static/immutable storage class (a local
+    // `static immutable x = ctfeExpr();` inside an ordinary function is still
+    // evaluated at compile time even though the function itself is runtime).
+    override void visit(const VariableDeclaration node) {
+        const topLevel = isFileScope;
+        const ctfeInit = topLevel
+            || hasStorageClass(node.storageClasses, "static")
+            || hasStorageClass(node.storageClasses, "immutable");
+        if (node.type !is null) this.visit(node.type);
+        foreach (d; node.declarators) {
+            if (d is null) continue;
+            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, "var");
+            if (d.templateParameters !is null) this.visit(d.templateParameters);
+            if (ctfeInit) visitCtfe(d.initializer);
+            else if (d.initializer !is null) this.visit(d.initializer);
+        }
+        if (node.autoDeclaration !is null) this.visit(node.autoDeclaration);
+    }
+
+    // `auto x = ...;` and manifest-constant `enum x = ...;` share this AST
+    // shape (distinguished only by an `enum` storage-class token). Same
+    // module-scope/static/immutable CTFE-initializer rule as
+    // VariableDeclaration, PLUS: an `enum` storage class always makes the
+    // initializer a CTFE root regardless of depth (a manifest constant is
+    // always compile-time, even one declared inside a function body).
+    override void visit(const AutoDeclaration node) {
+        const topLevel = isFileScope;
+        const isEnum = hasStorageClass(node.storageClasses, "enum");
+        const ctfeInit = topLevel || isEnum
+            || hasStorageClass(node.storageClasses, "static")
+            || hasStorageClass(node.storageClasses, "immutable");
+        foreach (part; node.parts) {
+            if (part is null) continue;
+            if (topLevel && part.identifier.text.length > 0) {
+                emitDeclares(part.identifier.text, isEnum ? "enum" : "var");
+            }
+            if (part.templateParameters !is null) this.visit(part.templateParameters);
+            if (ctfeInit) visitCtfe(part.initializer);
+            else if (part.initializer !is null) this.visit(part.initializer);
+        }
     }
 
     override void visit(const BlockStatement node) {
@@ -400,6 +690,67 @@ class ScopeInfoVisitor : ASTVisitor {
         node.accept(this);
     }
 
+    // static if condition (CTFE root) — the condition expression only; the
+    // true/false branches are ordinary declarations/statements at their own
+    // bodyDepth, reached normally via ConditionalDeclaration/ConditionalStatement
+    // (not overridden here), so they are NOT included in ctfeDepth.
+    override void visit(const StaticIfCondition node) {
+        visitCtfe(node);
+    }
+
+    // static assert (CTFE root) — condition and message are both evaluated
+    // at compile time.
+    override void visit(const StaticAssertStatement node) {
+        visitCtfe(node);
+    }
+
+    // static foreach, declaration position (module/aggregate scope) — e.g.
+    // `static foreach (i; 0 .. N) { ... }` as a declaration. Foreach!true and
+    // Foreach!false (ForeachStatement) are distinct D types from the same
+    // template, so this doesn't collide with ordinary runtime foreach.
+    // Whole construct (range expression AND generated body) is wrapped for
+    // simplicity — see visitCtfe's doc comment on the conservative bias.
+    override void visit(const StaticForeachDeclaration node) {
+        visitCtfe(node);
+    }
+
+    // static foreach, statement position (inside a function body) — wraps an
+    // ordinary ForeachStatement; same conservative whole-construct wrapping.
+    override void visit(const StaticForeachStatement node) {
+        visitCtfe(node);
+    }
+
+    // Template VALUE argument (as opposed to a type argument) in an
+    // instantiation, e.g. the `3` in `Foo!(3)` — evaluated at compile time.
+    override void visit(const TemplateArgument node) {
+        if (node.type !is null) this.visit(node.type);
+        visitCtfe(node.assignExpression);
+    }
+
+    // mixin(...) argument expressions (CTFE root) — the string(s) being
+    // mixed in must themselves be compile-time-computable.
+    override void visit(const MixinExpression node) {
+        visitCtfe(node);
+    }
+
+    // pragma(...) argument expressions (CTFE root).
+    override void visit(const PragmaExpression node) {
+        visitCtfe(node);
+    }
+
+    // Static array dimension expression(s) in a type, e.g. the `N` in `T[N]`
+    // (CTFE root). `high` is also wrapped defensively (array-type-suffix
+    // range forms); harmless if unused for a given suffix shape.
+    override void visit(const TypeSuffix node) {
+        if (node.type !is null) this.visit(node.type);
+        visitCtfe(node.low);
+        visitCtfe(node.high);
+        if (node.parameters !is null) this.visit(node.parameters);
+        foreach (a; node.memberFunctionAttributes) {
+            if (a !is null) this.visit(a);
+        }
+    }
+
     // Emit every identifier referenced in an INTERFACE position (bodyDepth==0):
     // type names in signatures/fields, template params/constraints, manifest
     // initializers, default args — the identifiers that survive into the .di.
@@ -407,12 +758,26 @@ class ScopeInfoVisitor : ASTVisitor {
     // top-level declares-index; a `top`/selective import propagates only if it
     // provides an ifaceref'd symbol. Body-only references (bodyDepth>0) are
     // omitted — they're elided from the .di and don't propagate.
+    //
+    // Separately (and not mutually exclusive — see ctfeDepth's doc comment),
+    // emits `ctferef`/`ctferef_tmpl` when the reference is inside a CTFE-root
+    // context: `ctferef_tmpl` when also inside a template (its enclosing body
+    // survives hdrgen and is copied into every instantiator's compile, so the
+    // ref propagates to consumers — the iface_top_required lesson), plain
+    // `ctferef` otherwise.
     override void visit(const IdentifierOrTemplateInstance node) {
-        if (bodyDepth == 0) {
-            if (node.identifier.text.length > 0) {
-                output.writefln("ifaceref\t%s", node.identifier.text);
-            } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
-                output.writefln("ifaceref\t%s", node.templateInstance.identifier.text);
+        string sym;
+        if (node.identifier.text.length > 0) {
+            sym = node.identifier.text;
+        } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
+            sym = node.templateInstance.identifier.text;
+        }
+        if (sym.length > 0) {
+            if (bodyDepth == 0) {
+                output.writefln("ifaceref\t%s", sym);
+            }
+            if (ctfeDepth > 0) {
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
             }
         }
         node.accept(this);
@@ -422,16 +787,28 @@ class ScopeInfoVisitor : ASTVisitor {
     // in the .di (hdrgen keeps attributes on signatures), so their symbol leaks
     // through this file's interface and must count as an ifaceref. The UDA name
     // is a bare Token on AtAttribute (not wrapped in IdentifierOrTemplateInstance),
-    // so the visitor above never sees it — emit it here.
+    // so the visitor above never sees it — emit it here. Same ctferef/ctferef_tmpl
+    // extension as IdentifierOrTemplateInstance. UDA ARGUMENTS are themselves a
+    // CTFE root (docs/ctfe-per-symbol.md) — ctfeDepth is incremented around
+    // node.accept(this) (which visits templateInstance + argumentList), AFTER
+    // the UDA's own name is checked against the depth in effect on entry (the
+    // name itself isn't a "value" CTFE root, only its arguments are).
     override void visit(const AtAttribute node) {
-        if (bodyDepth == 0) {
-            if (node.identifier.text.length > 0) {
-                output.writefln("ifaceref\t%s", node.identifier.text);
-            } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
-                output.writefln("ifaceref\t%s", node.templateInstance.identifier.text);
+        string sym;
+        if (node.identifier.text.length > 0) {
+            sym = node.identifier.text;
+        } else if (node.templateInstance !is null && node.templateInstance.identifier.text.length > 0) {
+            sym = node.templateInstance.identifier.text;
+        }
+        if (sym.length > 0) {
+            if (bodyDepth == 0) {
+                output.writefln("ifaceref\t%s", sym);
+            }
+            if (ctfeDepth > 0) {
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
             }
         }
-        node.accept(this);
+        visitCtfe(node);
     }
 
     override void visit(const TemplateInstance node) {
@@ -441,12 +818,22 @@ class ScopeInfoVisitor : ASTVisitor {
         node.accept(this);
     }
 
+    // call <containing-function> <callee> — containerStack's innermost
+    // enclosing function (currentFunctionName; "_" for a call with no
+    // enclosing function, e.g. a module-level manifest-constant initializer)
+    // gives a per-function call graph instead of a file-level
+    // over-approximation. NOTE: this repurposes the second field, which used
+    // to carry the enclosing TEMPLATE name (empty when not in a template) —
+    // gazelled's scan.go (build/gazelle/d/scan.go handleLine, "call" case)
+    // never reads that field (only parts[2], the callee, populating a flat
+    // callSet with no per-container attribution), so this is not a breaking
+    // change to any current consumer; it's a free extension.
     override void visit(const FunctionCallExpression node) {
         // Skip explicit template calls foo!T(args) — the inner TemplateInstance already emits.
         if (node.templateArguments is null && node.unaryExpression !is null) {
             auto callee = extractCallee(node.unaryExpression);
             if (callee.length > 0) {
-                output.writefln("call\t%s\t%s", outerTemplate, callee);
+                output.writefln("call\t%s\t%s", currentFunctionName(), callee);
             }
         }
         node.accept(this);
