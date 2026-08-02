@@ -371,13 +371,32 @@ class ScopeInfoVisitor : ASTVisitor {
     private void emitDeclares(string name, string kind) {
         if (!isFileScope || name.length == 0) return;
         output.writefln("declares\t%s\t%s", name, kind);
-        if (!pendingUda.empty) {
-            foreach (n; pendingUda.emits) output.writefln("genemits\t%s\t%s", name, n);
-            foreach (p; pendingUda.patterns) output.writefln("genpattern\t%s\t%s", name, p);
-            if (pendingUda.unknown) output.writefln("genunknown\t%s", name);
-            foreach (m; pendingUda.ctfeCalls) output.writefln("genctfecalls\t%s\t%s", name, m);
-            pendingUda = PendingUda.init;
-        }
+        flushPendingUda(name);
+    }
+
+    // Flushes genemits/genpattern/genunknown/genctfecalls for `name` — the
+    // BARE declaration name, matching how `instance` (TemplateInstance) and
+    // `call` (FunctionCallExpression) already spell an instantiated/called
+    // symbol, so the Go side can join on it regardless of nesting depth.
+    //
+    // Unlike `declares` (module-scope-only by design, see emitDeclares' doc
+    // comment — symbol->file attribution goes through the ENCLOSING
+    // aggregate's own top-level declares entry), the generator UDAs
+    // (@GazelleEmits*/@GazelleCtfeCalls) annotate the GENERATOR itself, which
+    // is routinely nested (a mixin template inside a class/struct, a CTFE
+    // helper function inside a templated struct). Gating the flush on
+    // isFileScope would silently drop those annotations. So this is called
+    // unconditionally by every named-declaration visitor (both the
+    // isFileScope branch via emitDeclares, and the nested/else branch) —
+    // scope only decides whether `declares` also fires, not whether the
+    // pending UDA data is kept.
+    private void flushPendingUda(string name) {
+        if (name.length == 0 || pendingUda.empty) return;
+        foreach (n; pendingUda.emits) output.writefln("genemits\t%s\t%s", name, n);
+        foreach (p; pendingUda.patterns) output.writefln("genpattern\t%s\t%s", name, p);
+        if (pendingUda.unknown) output.writefln("genunknown\t%s", name);
+        foreach (m; pendingUda.ctfeCalls) output.writefln("genctfecalls\t%s\t%s", name, m);
+        pendingUda = PendingUda.init;
     }
 
     // Reads a single Attribute for our recognized generator UDAs
@@ -494,6 +513,12 @@ class ScopeInfoVisitor : ASTVisitor {
         if (isFileScope) {
             output.writefln("template\t%s", node.name.text);
             emitDeclares(node.name.text, "tmpl");
+        } else {
+            // Nested mixin template (e.g. inside a class/struct) — `declares`
+            // stays module-scope-only, but a @GazelleEmits*/@GazelleCtfeCalls
+            // UDA on THIS declaration still needs to flush (see
+            // flushPendingUda's doc comment).
+            flushPendingUda(node.name.text);
         }
         templateStack ~= node.name.text;
         containerStack ~= Container("template", node.name.text);
@@ -514,6 +539,10 @@ class ScopeInfoVisitor : ASTVisitor {
             if (isTemplate) emitDeclares(node.name.text, "tmpl");
             else if (node.hasAuto) emitDeclares(node.name.text, "autoret");
             else emitDeclares(node.name.text, "plain");
+        } else {
+            // Nested function (e.g. a CTFE-string-generator method inside a
+            // templated struct) — same rationale as TemplateDeclaration above.
+            flushPendingUda(node.name.text);
         }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);

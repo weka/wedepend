@@ -134,3 +134,39 @@ void generatorCtfeCalls() {}
 
 @GazelleEmits(someRuntimeArray)                   // non-literal — should warn on stderr, emit nothing
 void generatorNonLiteralArg() {}
+
+// --- UDA recognition on NESTED (non-file-scope) declarations ---
+// `declares` must NOT fire for any of these (nested, not module-scope), but
+// genemits/genpattern/genunknown/genctfecalls MUST fire anyway, keyed off the
+// bare declaration name — covering the nesting shapes that occur in real
+// codebases: class-nested mixin template, struct-nested mixin template,
+// template-nested function, and aggregate-nested string-mixin generator.
+
+class NestHostClass {
+    @GazelleEmits(["nestedInClassA", "nestedInClassB"])   // genemits NestedInClassTemplate nestedInClassA / ...B
+    mixin template NestedInClassTemplate(string fmt) {
+        void ctorLike() {}
+    }
+}
+
+struct NestHostStruct {
+    @GazelleEmitsPattern(["<0>_SUFFIX"])                  // genpattern NestedInStructTemplate <0>_SUFFIX
+    mixin template NestedInStructTemplate(string OPNAME) {
+        mixin(OPNAME ~ "_SUFFIX");
+    }
+}
+
+template NestHostTemplate(RC) {
+    @GazelleEmits(["RCType", "Owners"])                   // genemits nestedInTemplateFn RCType / Owners
+    string nestedInTemplateFn() {
+        return "";
+    }
+}
+
+struct NestHostTemplatedStruct(Root) {
+    @GazelleEmitsUnknown                                  // genunknown nestedCtfeCallsFn
+    @GazelleCtfeCalls(["example.common.globals"])            // genctfecalls nestedCtfeCallsFn example.common.globals
+    string nestedCtfeCallsFn() {
+        return "";
+    }
+}
