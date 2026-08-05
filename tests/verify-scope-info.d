@@ -3,6 +3,7 @@ module verify;
 import a.b;
 import std.algorithm : map, filter;
 import c.d, e.f;
+import renamed.mod : localAlias = originalName;   // binding renamed.mod localAlias=originalName
 
 void plain() {
     import scoped_a;

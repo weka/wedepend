@@ -495,11 +495,22 @@ class ScopeInfoVisitor : ASTVisitor {
                 auto mod = chainToString(si.identifierChain);
                 emitImport(mod);
                 if (mod.length > 0) {
+                    // Each entry is the LOCAL name (b.left — what's referenced at
+                    // use sites in THIS file), optionally suffixed `=<original>`
+                    // when the bind renames (`import mod : local = original;`,
+                    // b.right). Un-renamed binds (the common case) keep the
+                    // original bare-name format for back-compat with older Go-side
+                    // parsers; a renamed bind is otherwise indistinguishable from
+                    // an un-renamed one, which silently breaks any resolution that
+                    // needs the symbol's ACTUAL name in `mod` (P3 declared-but-
+                    // unreachable class (c), docs/ctfe-per-symbol.md).
                     string[] syms;
                     foreach (b; node.importBindings.importBinds) {
                         if (b is null) continue;
                         auto t = b.left.text;
-                        if (t.length > 0) syms ~= t;
+                        if (t.length == 0) continue;
+                        if (b.right.text.length > 0) syms ~= t ~ "=" ~ b.right.text;
+                        else syms ~= t;
                     }
                     if (syms.length > 0) {
                         output.writefln("binding\t%s\t%s", mod, syms.join(","));
