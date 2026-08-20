@@ -767,6 +767,14 @@ class ScopeInfoVisitor : ASTVisitor {
         visitCtfe(node.assignExpression);
     }
 
+    // Same, for libdparse's named-template-argument node (`Foo!(T: int)` support):
+    // newer libdparse builds instantiation args as NamedTemplateArgument, so the
+    // TemplateArgument override above never fires there.
+    override void visit(const NamedTemplateArgument node) {
+        if (node.type !is null) this.visit(node.type);
+        visitCtfe(node.assignExpression);
+    }
+
     // mixin(...) argument expressions (CTFE root) — the string(s) being
     // mixed in must themselves be compile-time-computable.
     override void visit(const MixinExpression node) {
