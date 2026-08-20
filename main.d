@@ -8,6 +8,7 @@ int main(string[] rawArgs)
 {
     bool includeUnittest;
     bool verbose;
+    bool scopeInfoMode;
     string[] args;
     string[] versions;
 
@@ -19,6 +20,9 @@ int main(string[] rawArgs)
         case "-v":
         case "--verbose":
             verbose = true;
+            break;
+        case "--scope-info":
+            scopeInfoMode = true;
             break;
         default:
             enum D_VERSION_STR = "-d-version=";
@@ -34,10 +38,14 @@ int main(string[] rawArgs)
         }
     }
     if (args.length != 1) {
-        writeln(" Usage: ", args[0], " [--unittest] <input_file>");
+        writeln(" Usage: ", rawArgs[0], " [--unittest|--scope-info] <input_file>");
         return 1;
     }
 
-    stdout.calcDependencies(args[0], includeUnittest, verbose, versions);
+    if (scopeInfoMode) {
+        stdout.scopeInfo(args[0]);
+    } else {
+        stdout.calcDependencies(args[0], includeUnittest, verbose, versions);
+    }
     return 0;
 }
