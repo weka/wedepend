@@ -279,7 +279,12 @@ class ScopeInfoVisitor : ASTVisitor {
     //   struct, class, interface, union → preserved in .di (must be in Bazel deps)
     // The name field is the enclosing decl name, or "_" for anonymous
     // (e.g. raw blocks, unittests).
-    struct Container { string kind; string name; }
+    // bodyKind, for kind=="func": "tmpl" | "autoret" | "plain". hdrgen keeps a
+    // function body in the .di when the function is a template or has an
+    // inferred return type, and drops it otherwise — so imports written inside
+    // the body only reach consumers in the first two cases. Empty for
+    // non-function containers.
+    struct Container { string kind; string name; string bodyKind; }
     Container[] containerStack;
 
     // Depth of enclosing function/unittest BODIES (BlockStatement under executable
@@ -309,6 +314,17 @@ class ScopeInfoVisitor : ASTVisitor {
     // they must always propagate — emitted as a `public <mod>` marker that the
     // scanner uses to exempt the module from usage-based reclassification.
     bool inPublicDecl;
+    // A `pragma(inline, ...)` attribute on a function (any argument, true or
+    // false) makes hdrgen keep its body in the .di. inlineAttr is set for the
+    // Declaration carrying the attribute; colonInline for a `pragma(inline, ..):`
+    // AttributeDeclaration, which applies to the rest of its declaration block.
+    bool inlineAttr;
+    bool colonInline;
+
+    static bool isInlinePragma(const Attribute a) {
+        return a !is null && a.pragmaExpression !is null
+            && a.pragmaExpression.identifier.text == "inline";
+    }
 
     // See PendingUda's doc comment.
     PendingUda pendingUda;
@@ -445,7 +461,17 @@ class ScopeInfoVisitor : ASTVisitor {
                     break;
                 }
             }
-            output.writefln("scoped\t%s\t%s\t%s", kind, name, mod);
+            // Retention is a property of the whole enclosing chain, not just the
+            // innermost container: a plain nested function inside an autoret or
+            // template body is itself emitted into the .di along with it.
+            string retention = "elided";
+            foreach (c; containerStack) {
+                if (c.kind == "func" && (c.bodyKind == "tmpl" || c.bodyKind == "autoret" || c.bodyKind == "inline")) {
+                    retention = "retained";
+                    break;
+                }
+            }
+            output.writefln("scoped\t%s\t%s\t%s\t%s", kind, name, mod, retention);
         } else {
             output.writefln("top\t%s", mod);
         }
@@ -477,11 +503,22 @@ class ScopeInfoVisitor : ASTVisitor {
         if (pub && node.importDeclaration !is null) inPublicDecl = true;
         scope(exit) inPublicDecl = saved;
 
+        bool savedInline = inlineAttr;
+        foreach (a; node.attributes) {
+            if (isInlinePragma(a)) { inlineAttr = true; break; }
+        }
+        scope(exit) inlineAttr = savedInline;
+
         foreach (a; node.attributes) {
             collectGazelleUda(a);
         }
         node.accept(this);
         pendingUda = PendingUda.init;
+    }
+
+    override void visit(const AttributeDeclaration node) {
+        if (isInlinePragma(node.attribute)) colonInline = true;
+        node.accept(this);
     }
 
     override void visit(const ImportDeclaration node) {
@@ -533,7 +570,10 @@ class ScopeInfoVisitor : ASTVisitor {
         }
         templateStack ~= node.name.text;
         containerStack ~= Container("template", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             templateStack = templateStack[0 .. $-1];
             containerStack = containerStack[0 .. $-1];
         }
@@ -545,10 +585,13 @@ class ScopeInfoVisitor : ASTVisitor {
     // a template) > plain (default/conservative: body elided by hdrgen).
     override void visit(const FunctionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
+        // An inferred return type shows up as a null returnType; libdparse's
+        // hasAuto is not set for a plain `auto f()`, so it cannot be used here.
+        const isAutoRet = node.returnType is null;
         const topLevel = isFileScope;
         if (topLevel) {
             if (isTemplate) emitDeclares(node.name.text, "tmpl");
-            else if (node.hasAuto) emitDeclares(node.name.text, "autoret");
+            else if (isAutoRet) emitDeclares(node.name.text, "autoret");
             else emitDeclares(node.name.text, "plain");
         } else {
             // Nested function (e.g. a CTFE-string-generator method inside a
@@ -559,8 +602,13 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerStack ~= Container("func", node.name.text);
+        const isInline = inlineAttr || colonInline;
+        containerStack ~= Container("func", node.name.text,
+                                    isTemplate ? "tmpl" : (isAutoRet ? "autoret" : (isInline ? "inline" : "plain")));
+        const savedInlineAttr = inlineAttr;
+        inlineAttr = false; // belongs to this declaration, not to functions nested in its body
         scope(exit) {
+            inlineAttr = savedInlineAttr;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -576,7 +624,10 @@ class ScopeInfoVisitor : ASTVisitor {
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("struct", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -592,7 +643,10 @@ class ScopeInfoVisitor : ASTVisitor {
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("class", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -608,7 +662,10 @@ class ScopeInfoVisitor : ASTVisitor {
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("interface", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -624,7 +681,10 @@ class ScopeInfoVisitor : ASTVisitor {
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("union", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
