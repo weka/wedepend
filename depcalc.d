@@ -320,6 +320,10 @@ class ScopeInfoVisitor : ASTVisitor {
     // AttributeDeclaration, which applies to the rest of its declaration block.
     bool inlineAttr;
     bool colonInline;
+    // `enum` given as a Declaration attribute (`enum ulong X = 1;` parses the
+    // storage class there, not on the VariableDeclaration): the nested
+    // declaration is a manifest constant.
+    bool pendingEnumAttr;
 
     static bool isInlinePragma(const Attribute a) {
         return a !is null && a.pragmaExpression !is null
@@ -508,6 +512,12 @@ class ScopeInfoVisitor : ASTVisitor {
             if (isInlinePragma(a)) { inlineAttr = true; break; }
         }
         scope(exit) inlineAttr = savedInline;
+
+        bool savedEnum = pendingEnumAttr;
+        foreach (a; node.attributes) {
+            if (a.attribute.type == tok!"enum") { pendingEnumAttr = true; break; }
+        }
+        scope(exit) pendingEnumAttr = savedEnum;
 
         foreach (a; node.attributes) {
             collectGazelleUda(a);
@@ -737,15 +747,21 @@ class ScopeInfoVisitor : ASTVisitor {
     // module-scope or carries a static/immutable storage class (a local
     // `static immutable x = ctfeExpr();` inside an ordinary function is still
     // evaluated at compile time even though the function itself is runtime).
+    // A typed manifest constant (`enum ulong X = ...;`) parses as a
+    // VariableDeclaration with an `enum` storage class; it is a compile-time
+    // value like the untyped form below, and hdrgen keeps its initializer in
+    // the .di, so it must not look like a variable (whose initializer hdrgen
+    // strips to `extern`).
     override void visit(const VariableDeclaration node) {
         const topLevel = isFileScope;
-        const ctfeInit = topLevel
+        const isEnum = hasStorageClass(node.storageClasses, "enum") || pendingEnumAttr;
+        const ctfeInit = topLevel || isEnum
             || hasStorageClass(node.storageClasses, "static")
             || hasStorageClass(node.storageClasses, "immutable");
         if (node.type !is null) this.visit(node.type);
         foreach (d; node.declarators) {
             if (d is null) continue;
-            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, "var");
+            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, isEnum ? "enum" : "var");
             if (d.templateParameters !is null) this.visit(d.templateParameters);
             if (ctfeInit) visitCtfe(d.initializer);
             else if (d.initializer !is null) this.visit(d.initializer);
@@ -761,7 +777,7 @@ class ScopeInfoVisitor : ASTVisitor {
     // always compile-time, even one declared inside a function body).
     override void visit(const AutoDeclaration node) {
         const topLevel = isFileScope;
-        const isEnum = hasStorageClass(node.storageClasses, "enum");
+        const isEnum = hasStorageClass(node.storageClasses, "enum") || pendingEnumAttr;
         const ctfeInit = topLevel || isEnum
             || hasStorageClass(node.storageClasses, "static")
             || hasStorageClass(node.storageClasses, "immutable");
