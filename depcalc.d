@@ -885,10 +885,13 @@ class ScopeInfoVisitor : ASTVisitor {
     //
     // Separately (and not mutually exclusive — see ctfeDepth's doc comment),
     // emits `ctferef`/`ctferef_tmpl` when the reference is inside a CTFE-root
-    // context: `ctferef_tmpl` when also inside a template (its enclosing body
+    // context. `ctferef_tmpl` when also inside a template (its enclosing body
     // survives hdrgen and is copied into every instantiator's compile, so the
     // ref propagates to consumers — the iface_top_required lesson), plain
-    // `ctferef` otherwise.
+    // `ctferef` otherwise. The third field says where the root sits: `decl`
+    // when outside every function body (an initializer, static assert, UDA or
+    // template argument — kept by hdrgen, re-evaluated by every consumer of
+    // the .di), `body` otherwise.
     override void visit(const IdentifierOrTemplateInstance node) {
         string sym;
         if (node.identifier.text.length > 0) {
@@ -901,7 +904,8 @@ class ScopeInfoVisitor : ASTVisitor {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s" : "ctferef\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body");
             }
         }
         node.accept(this);
@@ -929,7 +933,8 @@ class ScopeInfoVisitor : ASTVisitor {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s" : "ctferef\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body");
             }
         }
         visitCtfe(node);
