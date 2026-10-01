@@ -355,6 +355,31 @@ class ScopeInfoVisitor : ASTVisitor {
         return "_";
     }
 
+    // Innermost function or template whose analysis makes the code at this
+    // point live: a plain function (body elided for consumers), or a template
+    // (dormant until instantiated). Aggregates that are templates count as
+    // templates. "_" when the code is at module/aggregate scope.
+    private string refOwner() const {
+        foreach_reverse (c; containerStack) {
+            if (c.kind == "func" || c.kind == "template") return c.name;
+            if (templateStack.length > 0 && c.name == templateStack[$-1]) return c.name;
+        }
+        return "_";
+    }
+    bool[string] refSeen;
+
+    // Innermost enclosing template that code can name: operator templates
+    // (`opCall(Args...)`, `opDispatch`) and constructor templates are reached
+    // through syntax, never by identifier, so they instantiate whenever their
+    // enclosing template does — attribute their imports there.
+    private string gatingTemplate() const {
+        foreach_reverse (t; templateStack) {
+            if (t.startsWith("op") || t == "this" || t == "~this") continue;
+            return t;
+        }
+        return templateStack[0];
+    }
+
     // Runs `node` with ctfeDepth incremented for its duration — used by every
     // CTFE-root context (see ctfeDepth's doc comment). Visits the WHOLE node
     // (not just its value sub-expression): for constructs with both a
@@ -449,7 +474,21 @@ class ScopeInfoVisitor : ASTVisitor {
     private void emitImport(string mod) {
         if (mod.length == 0) return;
         if (templateStack.length > 0) {
-            output.writefln("tmpl\t%s\t%s", outerTemplate, mod);
+            // The innermost template is the one whose instantiation
+            // materializes this import: a nested `template X()` inside an
+            // instantiated struct template stays dormant until X itself is
+            // instantiated. decl: resolved at that instantiation (template or
+            // aggregate scope, template/auto/inline member body). body: inside
+            // a plain member function, analyzed only where the instance is
+            // emitted (the instantiating root module).
+            string scope_ = "decl";
+            foreach (c; containerStack) {
+                if (c.kind == "func" && c.bodyKind != "tmpl" && c.bodyKind != "autoret" && c.bodyKind != "inline") {
+                    scope_ = "body";
+                    break;
+                }
+            }
+            output.writefln("tmpl\t%s\t%s\t%s\t%s", outerTemplate, mod, scope_, gatingTemplate());
         } else if (containerStack.length > 0) {
             // Find the innermost NAMED container — skip past anonymous blocks
             // (function-body braces, if/while/with blocks). The kind we report
@@ -900,6 +939,14 @@ class ScopeInfoVisitor : ASTVisitor {
             sym = node.templateInstance.identifier.text;
         }
         if (sym.length > 0) {
+            // ref <owner> <identifier>: every name the code mentions, keyed by
+            // what must be analyzed for the mention to count. Deduplicated.
+            const owner = refOwner();
+            const key = owner ~ "\t" ~ sym;
+            if (key !in refSeen) {
+                refSeen[key] = true;
+                output.writefln("ref\t%s", key);
+            }
             if (bodyDepth == 0) {
                 output.writefln("ifaceref\t%s", sym);
             }
@@ -938,6 +985,15 @@ class ScopeInfoVisitor : ASTVisitor {
             }
         }
         visitCtfe(node);
+    }
+
+    // A declaration-position string mixin can instantiate anything by name
+    // the scanner never sees; consumers that analyze its owner re-run it.
+    override void visit(const MixinDeclaration node) {
+        if (node.mixinExpression !is null) {
+            output.writefln("mixindecl\t%s", refOwner());
+        }
+        node.accept(this);
     }
 
     override void visit(const TemplateInstance node) {
