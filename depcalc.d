@@ -419,6 +419,33 @@ class ScopeInfoVisitor : ASTVisitor {
         flushPendingUda(name);
     }
 
+    // declares <name> type <ctor|noctor>: constructing a type with no user
+    // constructor (nor static opCall, nor a mixin that could add one) runs
+    // no code of its own, so a CTFE construction needs only the .di.
+    private void emitTypeDeclares(string name, const StructBody body_) {
+        if (!isFileScope || name.length == 0) return;
+        output.writefln("declares\t%s\ttype\t%s", name, hasCtor(body_) ? "ctor" : "noctor");
+        flushPendingUda(name);
+    }
+
+    private static bool hasCtor(const StructBody body_) {
+        if (body_ is null) return false;
+        return hasCtorIn(body_.declarations);
+    }
+
+    private static bool hasCtorIn(const Declaration[] decls) {
+        foreach (d; decls) {
+            if (d is null) continue;
+            if (d.constructor !is null || d.postblit !is null) return true;
+            if (d.functionDeclaration !is null && d.functionDeclaration.name.text == "opCall") return true;
+            if (d.mixinDeclaration !is null) return true;
+            if (d.declarations.length > 0 && hasCtorIn(d.declarations)) return true;
+            if (d.conditionalDeclaration !is null
+                && (hasCtorIn(d.conditionalDeclaration.trueDeclarations) || hasCtorIn(d.conditionalDeclaration.falseDeclarations))) return true;
+        }
+        return false;
+    }
+
     // Flushes genemits/genpattern/genunknown/genctfecalls for `name` — the
     // BARE declaration name, matching how `instance` (TemplateInstance) and
     // `call` (FunctionCallExpression) already spell an instantiated/called
@@ -639,7 +666,11 @@ class ScopeInfoVisitor : ASTVisitor {
         const isAutoRet = node.returnType is null;
         const topLevel = isFileScope;
         if (topLevel) {
+            // proto: a body-less declaration (`void f(int);`) — nothing to
+            // need from the source when CTFE names it.
+            const isProto = node.functionBody is null || node.functionBody.missingFunctionBody !is null;
             if (isTemplate) emitDeclares(node.name.text, "tmpl");
+            else if (isProto) emitDeclares(node.name.text, "proto");
             else if (isAutoRet) emitDeclares(node.name.text, "autoret");
             else emitDeclares(node.name.text, "plain");
         } else {
@@ -667,7 +698,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const StructDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -686,7 +717,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const ClassDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -724,7 +755,7 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const UnionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
@@ -800,8 +831,20 @@ class ScopeInfoVisitor : ASTVisitor {
         if (node.type !is null) this.visit(node.type);
         foreach (d; node.declarators) {
             if (d is null) continue;
-            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, isEnum ? "enum" : "var");
-            if (d.templateParameters !is null) this.visit(d.templateParameters);
+            // `enum T name(params) = …;` is an eponymous template: its
+            // initializer is analyzed per instantiation, not with the file.
+            const isTmpl = d.templateParameters !is null;
+            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, isTmpl ? "tmpl" : (isEnum ? "enum" : "var"));
+            if (isTmpl) {
+                if (topLevel) output.writefln("template\t%s", d.name.text);
+                templateStack ~= d.name.text;
+                containerStack ~= Container("template", d.name.text);
+                this.visit(d.templateParameters);
+            }
+            scope(exit) if (isTmpl) {
+                containerStack = containerStack[0 .. $-1];
+                templateStack = templateStack[0 .. $-1];
+            }
             if (ctfeInit) visitCtfe(d.initializer);
             else if (d.initializer !is null) this.visit(d.initializer);
         }
@@ -822,13 +865,42 @@ class ScopeInfoVisitor : ASTVisitor {
             || hasStorageClass(node.storageClasses, "immutable");
         foreach (part; node.parts) {
             if (part is null) continue;
+            const isTmpl = part.templateParameters !is null;
             if (topLevel && part.identifier.text.length > 0) {
-                emitDeclares(part.identifier.text, isEnum ? "enum" : "var");
+                emitDeclares(part.identifier.text, isTmpl ? "tmpl" : (isEnum ? "enum" : "var"));
             }
-            if (part.templateParameters !is null) this.visit(part.templateParameters);
+            if (isTmpl) {
+                if (topLevel) output.writefln("template\t%s", part.identifier.text);
+                templateStack ~= part.identifier.text;
+                containerStack ~= Container("template", part.identifier.text);
+                this.visit(part.templateParameters);
+            }
+            scope(exit) if (isTmpl) {
+                containerStack = containerStack[0 .. $-1];
+                templateStack = templateStack[0 .. $-1];
+            }
             if (ctfeInit) visitCtfe(part.initializer);
             else if (part.initializer !is null) this.visit(part.initializer);
         }
+    }
+
+    // `enum T name(params) = …;` / `alias name(params) = …;`: an eponymous
+    // template whose value is analyzed per instantiation, and a CTFE root.
+    override void visit(const EponymousTemplateDeclaration node) {
+        const topLevel = isFileScope;
+        if (topLevel) {
+            emitDeclares(node.name.text, "tmpl");
+            output.writefln("template\t%s", node.name.text);
+        }
+        templateStack ~= node.name.text;
+        containerStack ~= Container("template", node.name.text);
+        scope(exit) {
+            containerStack = containerStack[0 .. $-1];
+            templateStack = templateStack[0 .. $-1];
+        }
+        if (node.templateParameters !is null) this.visit(node.templateParameters);
+        if (node.type !is null) this.visit(node.type);
+        if (node.assignExpression !is null) visitCtfe(node.assignExpression);
     }
 
     override void visit(const BlockStatement node) {
@@ -951,8 +1023,8 @@ class ScopeInfoVisitor : ASTVisitor {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s" : "ctferef\t%s\t%s", sym,
-                    bodyDepth == 0 ? "decl" : "body");
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s\t%s" : "ctferef\t%s\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body", currentFunctionName());
             }
         }
         node.accept(this);
@@ -980,8 +1052,8 @@ class ScopeInfoVisitor : ASTVisitor {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s" : "ctferef\t%s\t%s", sym,
-                    bodyDepth == 0 ? "decl" : "body");
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s\t%s" : "ctferef\t%s\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body", currentFunctionName());
             }
         }
         visitCtfe(node);
