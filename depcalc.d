@@ -279,7 +279,12 @@ class ScopeInfoVisitor : ASTVisitor {
     //   struct, class, interface, union → preserved in .di (must be in Bazel deps)
     // The name field is the enclosing decl name, or "_" for anonymous
     // (e.g. raw blocks, unittests).
-    struct Container { string kind; string name; }
+    // bodyKind, for kind=="func": "tmpl" | "autoret" | "plain". hdrgen keeps a
+    // function body in the .di when the function is a template or has an
+    // inferred return type, and drops it otherwise — so imports written inside
+    // the body only reach consumers in the first two cases. Empty for
+    // non-function containers.
+    struct Container { string kind; string name; string bodyKind; }
     Container[] containerStack;
 
     // Depth of enclosing function/unittest BODIES (BlockStatement under executable
@@ -309,6 +314,21 @@ class ScopeInfoVisitor : ASTVisitor {
     // they must always propagate — emitted as a `public <mod>` marker that the
     // scanner uses to exempt the module from usage-based reclassification.
     bool inPublicDecl;
+    // A `pragma(inline, ...)` attribute on a function (any argument, true or
+    // false) makes hdrgen keep its body in the .di. inlineAttr is set for the
+    // Declaration carrying the attribute; colonInline for a `pragma(inline, ..):`
+    // AttributeDeclaration, which applies to the rest of its declaration block.
+    bool inlineAttr;
+    bool colonInline;
+    // `enum` given as a Declaration attribute (`enum ulong X = 1;` parses the
+    // storage class there, not on the VariableDeclaration): the nested
+    // declaration is a manifest constant.
+    bool pendingEnumAttr;
+
+    static bool isInlinePragma(const Attribute a) {
+        return a !is null && a.pragmaExpression !is null
+            && a.pragmaExpression.identifier.text == "inline";
+    }
 
     // See PendingUda's doc comment.
     PendingUda pendingUda;
@@ -333,6 +353,31 @@ class ScopeInfoVisitor : ASTVisitor {
             if (c.kind == "func") return c.name;
         }
         return "_";
+    }
+
+    // Innermost function or template whose analysis makes the code at this
+    // point live: a plain function (body elided for consumers), or a template
+    // (dormant until instantiated). Aggregates that are templates count as
+    // templates. "_" when the code is at module/aggregate scope.
+    private string refOwner() const {
+        foreach_reverse (c; containerStack) {
+            if (c.kind == "func" || c.kind == "template") return c.name;
+            if (templateStack.length > 0 && c.name == templateStack[$-1]) return c.name;
+        }
+        return "_";
+    }
+    bool[string] refSeen;
+
+    // Innermost enclosing template that code can name: operator templates
+    // (`opCall(Args...)`, `opDispatch`) and constructor templates are reached
+    // through syntax, never by identifier, so they instantiate whenever their
+    // enclosing template does — attribute their imports there.
+    private string gatingTemplate() const {
+        foreach_reverse (t; templateStack) {
+            if (t.startsWith("op") || t == "this" || t == "~this") continue;
+            return t;
+        }
+        return templateStack[0];
     }
 
     // Runs `node` with ctfeDepth incremented for its duration — used by every
@@ -372,6 +417,34 @@ class ScopeInfoVisitor : ASTVisitor {
         if (!isFileScope || name.length == 0) return;
         output.writefln("declares\t%s\t%s", name, kind);
         flushPendingUda(name);
+    }
+
+    // declares <name> type <ctor|noctor>: constructing a type with no user
+    // constructor (nor static opCall, nor a mixin that could add one) runs
+    // no code of its own, so a CTFE construction needs only the .di.
+    private void emitTypeDeclares(string name, const StructBody body_) {
+        if (!isFileScope || name.length == 0) return;
+        output.writefln("declares\t%s\ttype\t%s", name, hasCtor(body_) ? "ctor" : "noctor");
+        flushPendingUda(name);
+    }
+
+    private static bool hasCtor(const StructBody body_) {
+        if (body_ is null) return false;
+        return hasCtorIn(body_.declarations);
+    }
+
+    private static bool hasCtorIn(const Declaration[] decls) {
+        foreach (d; decls) {
+            if (d is null) continue;
+            // A destructor counts: CTFE runs ~this at scope exit, so its body is needed too.
+            if (d.constructor !is null || d.postblit !is null || d.destructor !is null) return true;
+            if (d.functionDeclaration !is null && d.functionDeclaration.name.text == "opCall") return true;
+            if (d.mixinDeclaration !is null) return true;
+            if (d.declarations.length > 0 && hasCtorIn(d.declarations)) return true;
+            if (d.conditionalDeclaration !is null
+                && (hasCtorIn(d.conditionalDeclaration.trueDeclarations) || hasCtorIn(d.conditionalDeclaration.falseDeclarations))) return true;
+        }
+        return false;
     }
 
     // Flushes genemits/genpattern/genunknown/genctfecalls for `name` — the
@@ -429,7 +502,21 @@ class ScopeInfoVisitor : ASTVisitor {
     private void emitImport(string mod) {
         if (mod.length == 0) return;
         if (templateStack.length > 0) {
-            output.writefln("tmpl\t%s\t%s", outerTemplate, mod);
+            // The innermost template is the one whose instantiation
+            // materializes this import: a nested `template X()` inside an
+            // instantiated struct template stays dormant until X itself is
+            // instantiated. decl: resolved at that instantiation (template or
+            // aggregate scope, template/auto/inline member body). body: inside
+            // a plain member function, analyzed only where the instance is
+            // emitted (the instantiating root module).
+            string scope_ = "decl";
+            foreach (c; containerStack) {
+                if (c.kind == "func" && c.bodyKind != "tmpl" && c.bodyKind != "autoret" && c.bodyKind != "inline") {
+                    scope_ = "body";
+                    break;
+                }
+            }
+            output.writefln("tmpl\t%s\t%s\t%s\t%s", outerTemplate, mod, scope_, gatingTemplate());
         } else if (containerStack.length > 0) {
             // Find the innermost NAMED container — skip past anonymous blocks
             // (function-body braces, if/while/with blocks). The kind we report
@@ -445,7 +532,17 @@ class ScopeInfoVisitor : ASTVisitor {
                     break;
                 }
             }
-            output.writefln("scoped\t%s\t%s\t%s", kind, name, mod);
+            // Retention is a property of the whole enclosing chain, not just the
+            // innermost container: a plain nested function inside an autoret or
+            // template body is itself emitted into the .di along with it.
+            string retention = "elided";
+            foreach (c; containerStack) {
+                if (c.kind == "func" && (c.bodyKind == "tmpl" || c.bodyKind == "autoret" || c.bodyKind == "inline")) {
+                    retention = "retained";
+                    break;
+                }
+            }
+            output.writefln("scoped\t%s\t%s\t%s\t%s", kind, name, mod, retention);
         } else {
             output.writefln("top\t%s", mod);
         }
@@ -477,11 +574,28 @@ class ScopeInfoVisitor : ASTVisitor {
         if (pub && node.importDeclaration !is null) inPublicDecl = true;
         scope(exit) inPublicDecl = saved;
 
+        bool savedInline = inlineAttr;
+        foreach (a; node.attributes) {
+            if (isInlinePragma(a)) { inlineAttr = true; break; }
+        }
+        scope(exit) inlineAttr = savedInline;
+
+        bool savedEnum = pendingEnumAttr;
+        foreach (a; node.attributes) {
+            if (a.attribute.type == tok!"enum") { pendingEnumAttr = true; break; }
+        }
+        scope(exit) pendingEnumAttr = savedEnum;
+
         foreach (a; node.attributes) {
             collectGazelleUda(a);
         }
         node.accept(this);
         pendingUda = PendingUda.init;
+    }
+
+    override void visit(const AttributeDeclaration node) {
+        if (isInlinePragma(node.attribute)) colonInline = true;
+        node.accept(this);
     }
 
     override void visit(const ImportDeclaration node) {
@@ -533,7 +647,10 @@ class ScopeInfoVisitor : ASTVisitor {
         }
         templateStack ~= node.name.text;
         containerStack ~= Container("template", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             templateStack = templateStack[0 .. $-1];
             containerStack = containerStack[0 .. $-1];
         }
@@ -545,10 +662,17 @@ class ScopeInfoVisitor : ASTVisitor {
     // a template) > plain (default/conservative: body elided by hdrgen).
     override void visit(const FunctionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
+        // An inferred return type shows up as a null returnType; libdparse's
+        // hasAuto is not set for a plain `auto f()`, so it cannot be used here.
+        const isAutoRet = node.returnType is null;
         const topLevel = isFileScope;
         if (topLevel) {
+            // proto: a body-less declaration (`void f(int);`) — nothing to
+            // need from the source when CTFE names it.
+            const isProto = node.functionBody is null || node.functionBody.missingFunctionBody !is null;
             if (isTemplate) emitDeclares(node.name.text, "tmpl");
-            else if (node.hasAuto) emitDeclares(node.name.text, "autoret");
+            else if (isProto) emitDeclares(node.name.text, "proto");
+            else if (isAutoRet) emitDeclares(node.name.text, "autoret");
             else emitDeclares(node.name.text, "plain");
         } else {
             // Nested function (e.g. a CTFE-string-generator method inside a
@@ -559,8 +683,13 @@ class ScopeInfoVisitor : ASTVisitor {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
-        containerStack ~= Container("func", node.name.text);
+        const isInline = inlineAttr || colonInline;
+        containerStack ~= Container("func", node.name.text,
+                                    isTemplate ? "tmpl" : (isAutoRet ? "autoret" : (isInline ? "inline" : "plain")));
+        const savedInlineAttr = inlineAttr;
+        inlineAttr = false; // belongs to this declaration, not to functions nested in its body
         scope(exit) {
+            inlineAttr = savedInlineAttr;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -570,13 +699,16 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const StructDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("struct", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -586,13 +718,16 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const ClassDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("class", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -608,7 +743,10 @@ class ScopeInfoVisitor : ASTVisitor {
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("interface", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -618,13 +756,16 @@ class ScopeInfoVisitor : ASTVisitor {
     override void visit(const UnionDeclaration node) {
         const isTemplate = node.templateParameters !is null;
         const topLevel = isFileScope;
-        if (topLevel) emitDeclares(node.name.text, isTemplate ? "tmpl" : "type");
+        if (topLevel) { if (isTemplate) emitDeclares(node.name.text, "tmpl"); else emitTypeDeclares(node.name.text, node.structBody); }
         if (isTemplate) {
             if (topLevel) output.writefln("template\t%s", node.name.text);
             templateStack ~= node.name.text;
         }
         containerStack ~= Container("union", node.name.text);
+        const savedColon = colonInline; // a `pragma(inline, ..):` applies within one declaration block
+        colonInline = false;
         scope(exit) {
+            colonInline = savedColon;
             containerStack = containerStack[0 .. $-1];
             if (isTemplate) templateStack = templateStack[0 .. $-1];
         }
@@ -677,16 +818,34 @@ class ScopeInfoVisitor : ASTVisitor {
     // module-scope or carries a static/immutable storage class (a local
     // `static immutable x = ctfeExpr();` inside an ordinary function is still
     // evaluated at compile time even though the function itself is runtime).
+    // A typed manifest constant (`enum ulong X = ...;`) parses as a
+    // VariableDeclaration with an `enum` storage class; it is a compile-time
+    // value like the untyped form below, and hdrgen keeps its initializer in
+    // the .di, so it must not look like a variable (whose initializer hdrgen
+    // strips to `extern`).
     override void visit(const VariableDeclaration node) {
         const topLevel = isFileScope;
-        const ctfeInit = topLevel
+        const isEnum = hasStorageClass(node.storageClasses, "enum") || pendingEnumAttr;
+        const ctfeInit = topLevel || isEnum
             || hasStorageClass(node.storageClasses, "static")
             || hasStorageClass(node.storageClasses, "immutable");
         if (node.type !is null) this.visit(node.type);
         foreach (d; node.declarators) {
             if (d is null) continue;
-            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, "var");
-            if (d.templateParameters !is null) this.visit(d.templateParameters);
+            // `enum T name(params) = …;` is an eponymous template: its
+            // initializer is analyzed per instantiation, not with the file.
+            const isTmpl = d.templateParameters !is null;
+            if (topLevel && d.name.text.length > 0) emitDeclares(d.name.text, isTmpl ? "tmpl" : (isEnum ? "enum" : "var"));
+            if (isTmpl) {
+                if (topLevel) output.writefln("template\t%s", d.name.text);
+                templateStack ~= d.name.text;
+                containerStack ~= Container("template", d.name.text);
+                this.visit(d.templateParameters);
+            }
+            scope(exit) if (isTmpl) {
+                containerStack = containerStack[0 .. $-1];
+                templateStack = templateStack[0 .. $-1];
+            }
             if (ctfeInit) visitCtfe(d.initializer);
             else if (d.initializer !is null) this.visit(d.initializer);
         }
@@ -701,19 +860,48 @@ class ScopeInfoVisitor : ASTVisitor {
     // always compile-time, even one declared inside a function body).
     override void visit(const AutoDeclaration node) {
         const topLevel = isFileScope;
-        const isEnum = hasStorageClass(node.storageClasses, "enum");
+        const isEnum = hasStorageClass(node.storageClasses, "enum") || pendingEnumAttr;
         const ctfeInit = topLevel || isEnum
             || hasStorageClass(node.storageClasses, "static")
             || hasStorageClass(node.storageClasses, "immutable");
         foreach (part; node.parts) {
             if (part is null) continue;
+            const isTmpl = part.templateParameters !is null;
             if (topLevel && part.identifier.text.length > 0) {
-                emitDeclares(part.identifier.text, isEnum ? "enum" : "var");
+                emitDeclares(part.identifier.text, isTmpl ? "tmpl" : (isEnum ? "enum" : "var"));
             }
-            if (part.templateParameters !is null) this.visit(part.templateParameters);
+            if (isTmpl) {
+                if (topLevel) output.writefln("template\t%s", part.identifier.text);
+                templateStack ~= part.identifier.text;
+                containerStack ~= Container("template", part.identifier.text);
+                this.visit(part.templateParameters);
+            }
+            scope(exit) if (isTmpl) {
+                containerStack = containerStack[0 .. $-1];
+                templateStack = templateStack[0 .. $-1];
+            }
             if (ctfeInit) visitCtfe(part.initializer);
             else if (part.initializer !is null) this.visit(part.initializer);
         }
+    }
+
+    // `enum T name(params) = …;` / `alias name(params) = …;`: an eponymous
+    // template whose value is analyzed per instantiation, and a CTFE root.
+    override void visit(const EponymousTemplateDeclaration node) {
+        const topLevel = isFileScope;
+        if (topLevel) {
+            emitDeclares(node.name.text, "tmpl");
+            output.writefln("template\t%s", node.name.text);
+        }
+        templateStack ~= node.name.text;
+        containerStack ~= Container("template", node.name.text);
+        scope(exit) {
+            containerStack = containerStack[0 .. $-1];
+            templateStack = templateStack[0 .. $-1];
+        }
+        if (node.templateParameters !is null) this.visit(node.templateParameters);
+        if (node.type !is null) this.visit(node.type);
+        if (node.assignExpression !is null) visitCtfe(node.assignExpression);
     }
 
     override void visit(const BlockStatement node) {
@@ -809,10 +997,13 @@ class ScopeInfoVisitor : ASTVisitor {
     //
     // Separately (and not mutually exclusive — see ctfeDepth's doc comment),
     // emits `ctferef`/`ctferef_tmpl` when the reference is inside a CTFE-root
-    // context: `ctferef_tmpl` when also inside a template (its enclosing body
+    // context. `ctferef_tmpl` when also inside a template (its enclosing body
     // survives hdrgen and is copied into every instantiator's compile, so the
     // ref propagates to consumers — the iface_top_required lesson), plain
-    // `ctferef` otherwise.
+    // `ctferef` otherwise. The third field says where the root sits: `decl`
+    // when outside every function body (an initializer, static assert, UDA or
+    // template argument — kept by hdrgen, re-evaluated by every consumer of
+    // the .di), `body` otherwise.
     override void visit(const IdentifierOrTemplateInstance node) {
         string sym;
         if (node.identifier.text.length > 0) {
@@ -821,11 +1012,20 @@ class ScopeInfoVisitor : ASTVisitor {
             sym = node.templateInstance.identifier.text;
         }
         if (sym.length > 0) {
+            // ref <owner> <identifier>: every name the code mentions, keyed by
+            // what must be analyzed for the mention to count. Deduplicated.
+            const owner = refOwner();
+            const key = owner ~ "\t" ~ sym;
+            if (key !in refSeen) {
+                refSeen[key] = true;
+                output.writefln("ref\t%s", key);
+            }
             if (bodyDepth == 0) {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s\t%s" : "ctferef\t%s\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body", currentFunctionName());
             }
         }
         node.accept(this);
@@ -853,10 +1053,20 @@ class ScopeInfoVisitor : ASTVisitor {
                 output.writefln("ifaceref\t%s", sym);
             }
             if (ctfeDepth > 0) {
-                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s" : "ctferef\t%s", sym);
+                output.writefln(templateStack.length > 0 ? "ctferef_tmpl\t%s\t%s\t%s" : "ctferef\t%s\t%s\t%s", sym,
+                    bodyDepth == 0 ? "decl" : "body", currentFunctionName());
             }
         }
         visitCtfe(node);
+    }
+
+    // A declaration-position string mixin can instantiate anything by name
+    // the scanner never sees; consumers that analyze its owner re-run it.
+    override void visit(const MixinDeclaration node) {
+        if (node.mixinExpression !is null) {
+            output.writefln("mixindecl\t%s", refOwner());
+        }
+        node.accept(this);
     }
 
     override void visit(const TemplateInstance node) {
