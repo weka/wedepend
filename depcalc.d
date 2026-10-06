@@ -436,7 +436,8 @@ class ScopeInfoVisitor : ASTVisitor {
     private static bool hasCtorIn(const Declaration[] decls) {
         foreach (d; decls) {
             if (d is null) continue;
-            if (d.constructor !is null || d.postblit !is null) return true;
+            // A destructor counts: CTFE runs ~this at scope exit, so its body is needed too.
+            if (d.constructor !is null || d.postblit !is null || d.destructor !is null) return true;
             if (d.functionDeclaration !is null && d.functionDeclaration.name.text == "opCall") return true;
             if (d.mixinDeclaration !is null) return true;
             if (d.declarations.length > 0 && hasCtorIn(d.declarations)) return true;
